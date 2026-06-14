@@ -177,7 +177,7 @@ BASE_TEMPLATE = '''<!DOCTYPE html>
 </style>
 </head>
 <body>
-{{ content }}
+{{ content | safe }}
 </body>
 </html>'''
 
