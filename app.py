@@ -3,11 +3,12 @@ import os
 import secrets
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+from markupsafe import escape
 
 app = Flask(__name__)
 app.secret_key = os.urandom(32)
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'expenses.json')
+DB_PATH = os.environ.get('DB_PATH', '/var/data/expenses.json')
 
 # ─── Data layer (JSON file, no external DB needed) ───
 
@@ -299,9 +300,9 @@ def group_view(code):
     settlement_html = ""
     for d in debts:
         settlement_html += f'''<div class="settlement">
-            <span style="font-weight:600">{d['from']}</span>
+            <span style="font-weight:600">{escape(d['from'])}</span>
             <span class="arrow">→</span>
-            <span style="font-weight:600">{d['to']}</span>
+            <span style="font-weight:600">{escape(d['to'])}</span>
             <span class="amount">₹{d['amount']:,.0f}</span>
           </div>'''
     if not debts:
@@ -313,7 +314,7 @@ def group_view(code):
         sign = "+" if v > 0 else ""
         emoji = "🟢" if v > 0.01 else ("🔴" if v < -0.01 else "⚪")
         balance_html += f'''<div class="balance-row">
-              <span class="name">{emoji} {k}</span>
+              <span class="name">{emoji} {escape(k)}</span>
               <span class="amount {cls}">{sign}₹{v:,.0f}</span>
             </div>'''
 
@@ -323,8 +324,8 @@ def group_view(code):
         expense_html += f'''<div class="expense">
           <div class="icon {cat_classes.get(cat,'cat-other')}">{cat_icons.get(cat,'📦')}</div>
           <div class="details">
-            <div class="desc">{e['description']}</div>
-            <div class="meta">Paid by {e['payer']} · {e.get('date','')}</div>
+            <div class="desc">{escape(e['description'])}</div>
+            <div class="meta">Paid by {escape(e['payer'])} · {e.get('date','')}</div>
           </div>
           <div class="amount">₹{e['amount']:,.0f}</div>
           <form action="/delete/{code}/{e.get('id','')}" method="POST" style="display:inline">
@@ -339,8 +340,8 @@ def group_view(code):
 
     html = f'''<div class="container">
       <div class="header">
-        <h1>{group['name']}</h1>
-        <div class="subtitle">{", ".join(group['members'])} · {len(expenses)} expenses</div>
+        <h1>{escape(group['name'])}</h1>
+        <div class="subtitle">{", ".join(escape(m) for m in group['members'])} · {len(expenses)} expenses</div>
       </div>
       <div class="tabs">
         <div class="tab active" onclick="showTab('balances',this)">Balances</div>
@@ -431,14 +432,14 @@ def add_expense(code):
     member_chips = ""
     payer_chips = ""
     for i, m in enumerate(group["members"]):
-        payer_chips += f'<div class="chip {"active" if i==0 else ""}" onclick="selectPayer(this)">{m}</div>'
+        payer_chips += f'<div class="chip {"active" if i==0 else ""}" onclick="selectPayer(this)">{escape(m)}</div>'
     for i, c in enumerate(categories):
         member_chips += f'<div class="chip {"active" if i==0 else ""}" onclick="selectChip(this)" data-value="{c}">{c}</div>'
 
     html = f'''<div class="container">
       <div class="header">
         <h1>➕ Add Expense</h1>
-        <div class="subtitle">{group['name']}</div>
+        <div class="subtitle">{escape(group['name'])}</div>
       </div>
       <form method="POST">
         <div class="card">
@@ -458,7 +459,7 @@ def add_expense(code):
           <div class="form-group">
             <label>Who paid?</label>
             <div class="member-chips" id="payer-chips">{payer_chips}</div>
-            <input type="hidden" name="payer" id="payer" value="{group['members'][0]}">
+            <input type="hidden" name="payer" id="payer" value="{escape(group['members'][0])}">
           </div>
         </div>
         <button type="submit" class="btn btn-primary" style="margin-top:8px">Add Expense ✓</button>
