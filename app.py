@@ -8,7 +8,7 @@ from markupsafe import escape
 app = Flask(__name__)
 app.secret_key = os.urandom(32)
 
-DB_PATH = os.environ.get('DB_PATH', '/var/data/expenses.json')
+DB_PATH = os.environ.get('DB_PATH', os.path.join('/tmp', 'split-easy-data', 'expenses.json'))
 
 # ─── Data layer (JSON file, no external DB needed) ───
 
