@@ -8,17 +8,21 @@ from pymongo import MongoClient
 app = Flask(__name__)
 app.secret_key = os.urandom(32)
 
-MONGO_URI = os.environ.get('MONGO_URI', 'mongodb://localhost:27017')
-DB_NAME = os.environ.get('MONGO_DB', 'spliteasy')
+_MONGO_URI = None
+_db = None
 
-client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-db = client[DB_NAME]
-groups_col = db['groups']
-expenses_col = db['expenses']
-
-# Ensure indexes
-groups_col.create_index('code', unique=True)
-expenses_col.create_index('group_id')
+def get_db():
+    global _MONGO_URI, _db
+    if _db is not None:
+        return _db
+    uri = os.environ.get('MONGO_URI', 'mongodb://localhost:27017')
+    name = os.environ.get('MONGO_DB', 'spliteasy')
+    _MONGO_URI = uri
+    c = MongoClient(uri, serverSelectionTimeoutMS=10000)
+    _db = c[name]
+    _db['groups'].create_index('code', unique=True)
+    _db['expenses'].create_index('group_id')
+    return _db
 
 def simplify_debts(balances):
     """Minimize number of transactions to settle up."""
@@ -226,7 +230,8 @@ def create_group():
     group_id = secrets.token_urlsafe(16)
     code = secrets.token_hex(3).upper()
 
-    groups_col.insert_one({
+    db = get_db()
+    db['groups'].insert_one({
         "code": code,
         "id": group_id,
         "name": group_name,
@@ -242,7 +247,8 @@ def join_group():
     code = request.form['group_code'].strip().upper()
     member_name = request.form['member_name'].strip()
 
-    group = groups_col.find_one({"code": code})
+    db = get_db()
+    group = db['groups'].find_one({"code": code})
     if not group:
         return render_template_string(BASE_TEMPLATE, title="Error", content='''
         <div class="container">
@@ -251,19 +257,20 @@ def join_group():
         </div>'''), 404
 
     if member_name not in group["members"]:
-        groups_col.update_one({"code": code}, {"$addToSet": {"members": member_name}})
+        db['groups'].update_one({"code": code}, {"$addToSet": {"members": member_name}})
 
     return redirect(url_for('group_view', code=code))
 
 
 @app.route('/g/<code>')
 def group_view(code):
-    group = groups_col.find_one({"code": code.upper()})
+    db = get_db()
+    group = db['groups'].find_one({"code": code.upper()})
     if not group:
         return redirect('/')
 
     group_id = group["id"]
-    expenses = list(expenses_col.find({"group_id": group_id}).sort("_id", 1))
+    expenses = list(db['expenses'].find({"group_id": group_id}).sort("_id", 1))
     total = sum(e["amount"] for e in expenses)
     group.pop("_id", None)
     for e in expenses:
@@ -390,7 +397,8 @@ def group_view(code):
 
 @app.route('/add/<code>', methods=['GET', 'POST'])
 def add_expense(code):
-    group = groups_col.find_one({"code": code.upper()})
+    db = get_db()
+    group = db['groups'].find_one({"code": code.upper()})
     if not group:
         return redirect('/')
 
@@ -400,7 +408,7 @@ def add_expense(code):
         payer = request.form['payer']
         category = request.form.get('category', '📦 Other')
 
-        expenses_col.insert_one({
+        db['expenses'].insert_one({
             "id": secrets.token_hex(8),
             "group_id": group["id"],
             "description": description,
@@ -469,20 +477,22 @@ def add_expense(code):
 
 @app.route('/delete/<code>/<exp_id>', methods=['POST'])
 def delete_expense(code, exp_id):
-    group = groups_col.find_one({"code": code.upper()})
+    db = get_db()
+    group = db['groups'].find_one({"code": code.upper()})
     if group:
-        expenses_col.delete_one({"group_id": group["id"], "id": exp_id})
+        db['expenses'].delete_one({"group_id": group["id"], "id": exp_id})
     return redirect(url_for('group_view', code=code))
 
 
 @app.route('/api/<code>')
 def api_group(code):
-    group = groups_col.find_one({"code": code.upper()})
+    db = get_db()
+    group = db['groups'].find_one({"code": code.upper()})
     if not group:
         return jsonify({"error": "not found"}), 404
 
     group_id = group["id"]
-    expenses = list(expenses_col.find({"group_id": group_id}).sort("_id", 1))
+    expenses = list(db['expenses'].find({"group_id": group_id}).sort("_id", 1))
     # Remove MongoDB's _id field (not JSON serializable)
     for e in expenses:
         e.pop("_id", None)
