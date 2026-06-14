@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify, render_template_string, redirect, url
 app = Flask(__name__)
 app.secret_key = os.urandom(32)
 
-DB_PATH = '/opt/data/split-easy/expenses.json'
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'expenses.json')
 
 # ─── Data layer (JSON file, no external DB needed) ───
 
