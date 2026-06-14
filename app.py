@@ -1,30 +1,24 @@
-import json
 import os
 import secrets
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for
 from markupsafe import escape
+from pymongo import MongoClient
 
 app = Flask(__name__)
 app.secret_key = os.urandom(32)
 
-DB_PATH = os.environ.get('DB_PATH', os.path.join('/tmp', 'split-easy-data', 'expenses.json'))
+MONGO_URI = os.environ.get('MONGO_URI', 'mongodb://localhost:27017')
+DB_NAME = os.environ.get('MONGO_DB', 'spliteasy')
 
-# ─── Data layer (JSON file, no external DB needed) ───
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+db = client[DB_NAME]
+groups_col = db['groups']
+expenses_col = db['expenses']
 
-def load_data():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    if not os.path.exists(DB_PATH):
-        default = {"groups": {}, "expenses": {}, "settlements": {}}
-        save_data(default)
-        return default
-    with open(DB_PATH, 'r') as f:
-        return json.load(f)
-
-def save_data(data):
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    with open(DB_PATH, 'w') as f:
-        json.dump(data, f, indent=2)
+# Ensure indexes
+groups_col.create_index('code', unique=True)
+expenses_col.create_index('group_id')
 
 def simplify_debts(balances):
     """Minimize number of transactions to settle up."""
@@ -232,16 +226,13 @@ def create_group():
     group_id = secrets.token_urlsafe(16)
     code = secrets.token_hex(3).upper()
 
-    data = load_data()
-    data["groups"][code] = {
+    groups_col.insert_one({
+        "code": code,
         "id": group_id,
         "name": group_name,
         "members": [member_name],
         "created": datetime.now().isoformat()
-    }
-    data["expenses"][group_id] = []
-    data["settlements"][group_id] = []
-    save_data(data)
+    })
 
     return redirect(url_for('group_view', code=code))
 
@@ -251,8 +242,7 @@ def join_group():
     code = request.form['group_code'].strip().upper()
     member_name = request.form['member_name'].strip()
 
-    data = load_data()
-    group = data["groups"].get(code)
+    group = groups_col.find_one({"code": code})
     if not group:
         return render_template_string(BASE_TEMPLATE, title="Error", content='''
         <div class="container">
@@ -261,22 +251,23 @@ def join_group():
         </div>'''), 404
 
     if member_name not in group["members"]:
-        group["members"].append(member_name)
-        save_data(data)
+        groups_col.update_one({"code": code}, {"$addToSet": {"members": member_name}})
 
     return redirect(url_for('group_view', code=code))
 
 
 @app.route('/g/<code>')
 def group_view(code):
-    data = load_data()
-    group = data["groups"].get(code.upper())
+    group = groups_col.find_one({"code": code.upper()})
     if not group:
         return redirect('/')
 
     group_id = group["id"]
-    expenses = data["expenses"].get(group_id, [])
+    expenses = list(expenses_col.find({"group_id": group_id}).sort("_id", 1))
     total = sum(e["amount"] for e in expenses)
+    group.pop("_id", None)
+    for e in expenses:
+        e.pop("_id", None)
 
     # Calculate balances
     balances = {m: 0.0 for m in group["members"]}
@@ -399,8 +390,7 @@ def group_view(code):
 
 @app.route('/add/<code>', methods=['GET', 'POST'])
 def add_expense(code):
-    data = load_data()
-    group = data["groups"].get(code.upper())
+    group = groups_col.find_one({"code": code.upper()})
     if not group:
         return redirect('/')
 
@@ -410,21 +400,16 @@ def add_expense(code):
         payer = request.form['payer']
         category = request.form.get('category', '📦 Other')
 
-        expense = {
+        expenses_col.insert_one({
             "id": secrets.token_hex(8),
+            "group_id": group["id"],
             "description": description,
             "amount": amount,
             "payer": payer,
             "category": category,
             "date": datetime.now().strftime("%d %b"),
             "created": datetime.now().isoformat()
-        }
-
-        group_id = group["id"]
-        if group_id not in data["expenses"]:
-            data["expenses"][group_id] = []
-        data["expenses"][group_id].append(expense)
-        save_data(data)
+        })
 
         return redirect(url_for('group_view', code=code))
 
@@ -484,38 +469,39 @@ def add_expense(code):
 
 @app.route('/delete/<code>/<exp_id>', methods=['POST'])
 def delete_expense(code, exp_id):
-    data = load_data()
-    group = data["groups"].get(code.upper())
+    group = groups_col.find_one({"code": code.upper()})
     if group:
-        group_id = group["id"]
-        data["expenses"][group_id] = [e for e in data["expenses"].get(group_id, []) if e.get("id") != exp_id]
-        save_data(data)
+        expenses_col.delete_one({"group_id": group["id"], "id": exp_id})
     return redirect(url_for('group_view', code=code))
 
 
 @app.route('/api/<code>')
 def api_group(code):
-    data = load_data()
-    group = data["groups"].get(code.upper())
+    group = groups_col.find_one({"code": code.upper()})
     if not group:
         return jsonify({"error": "not found"}), 404
 
     group_id = group["id"]
-    expenses = data["expenses"].get(group_id, [])
-    balances = {m: 0.0 for m in group["members"]}
+    expenses = list(expenses_col.find({"group_id": group_id}).sort("_id", 1))
+    # Remove MongoDB's _id field (not JSON serializable)
+    for e in expenses:
+        e.pop("_id", None)
+    group_doc = {k: v for k, v in group.items() if k != "_id"}
+
+    balances = {m: 0.0 for m in group_doc["members"]}
     for exp in expenses:
         amount = exp["amount"]
         payer = exp["payer"]
-        share = round(amount / len(group["members"]), 2)
-        for m in group["members"]:
+        share = round(amount / len(group_doc["members"]), 2)
+        for m in group_doc["members"]:
             if m == payer:
                 balances[m] += amount - share
             else:
                 balances[m] -= share
 
     return jsonify({
-        "group": group["name"],
-        "members": group["members"],
+        "group": group_doc["name"],
+        "members": group_doc["members"],
         "total": sum(e["amount"] for e in expenses),
         "balances": {k: round(v, 2) for k, v in balances.items()},
         "settlements": simplify_debts(balances),
