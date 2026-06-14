@@ -8,16 +8,14 @@ from pymongo import MongoClient
 app = Flask(__name__)
 app.secret_key = os.urandom(32)
 
-_MONGO_URI = None
 _db = None
 
 def get_db():
-    global _MONGO_URI, _db
+    global _db
     if _db is not None:
         return _db
     uri = os.environ.get('MONGO_URI', 'mongodb://localhost:27017')
     name = os.environ.get('MONGO_DB', 'spliteasy')
-    _MONGO_URI = uri
     c = MongoClient(uri, serverSelectionTimeoutMS=10000)
     _db = c[name]
     _db['groups'].create_index('code', unique=True)
@@ -25,7 +23,6 @@ def get_db():
     return _db
 
 def simplify_debts(balances):
-    """Minimize number of transactions to settle up."""
     creditors = []
     debtors = []
     for person, bal in balances.items():
@@ -33,11 +30,9 @@ def simplify_debts(balances):
             creditors.append([person, round(bal, 2)])
         elif bal < -0.01:
             debtors.append([person, round(-bal, 2)])
-    
     transactions = []
     creditors.sort(key=lambda x: -x[1])
     debtors.sort(key=lambda x: -x[1])
-    
     i, j = 0, 0
     while i < len(debtors) and j < len(creditors):
         d_amt = debtors[i][1]
@@ -56,8 +51,6 @@ def simplify_debts(balances):
         if creditors[j][1] < 0.01:
             j += 1
     return transactions
-
-# ─── HTML Template ───
 
 BASE_TEMPLATE = '''<!DOCTYPE html>
 <html lang="en">
@@ -181,8 +174,6 @@ BASE_TEMPLATE = '''<!DOCTYPE html>
 </html>'''
 
 
-# ─── Routes ───
-
 @app.route('/')
 def index():
     html = '''
@@ -223,6 +214,17 @@ def index():
     return render_template_string(BASE_TEMPLATE, title="SplitEasy", content=html)
 
 
+@app.route('/health')
+def health():
+    try:
+        db = get_db()
+        db.command('ping')
+        groups = db['groups'].count_documents({})
+        return jsonify({"status": "ok", "database": "connected", "groups": groups})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.route('/create', methods=['POST'])
 def create_group():
     group_name = request.form['group_name'].strip()
@@ -230,14 +232,21 @@ def create_group():
     group_id = secrets.token_urlsafe(16)
     code = secrets.token_hex(3).upper()
 
-    db = get_db()
-    db['groups'].insert_one({
-        "code": code,
-        "id": group_id,
-        "name": group_name,
-        "members": [member_name],
-        "created": datetime.now().isoformat()
-    })
+    try:
+        db = get_db()
+        db['groups'].insert_one({
+            "code": code,
+            "id": group_id,
+            "name": group_name,
+            "members": [member_name],
+            "created": datetime.now().isoformat()
+        })
+    except Exception as e:
+        return render_template_string(BASE_TEMPLATE, title="Error", content=f'''
+        <div class="container">
+          <div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
+          <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div>
+        </div>'''), 500
 
     return redirect(url_for('group_view', code=code))
 
@@ -247,8 +256,16 @@ def join_group():
     code = request.form['group_code'].strip().upper()
     member_name = request.form['member_name'].strip()
 
-    db = get_db()
-    group = db['groups'].find_one({"code": code})
+    try:
+        db = get_db()
+        group = db['groups'].find_one({"code": code})
+    except Exception as e:
+        return render_template_string(BASE_TEMPLATE, title="Error", content=f'''
+        <div class="container">
+          <div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
+          <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div>
+        </div>'''), 500
+
     if not group:
         return render_template_string(BASE_TEMPLATE, title="Error", content='''
         <div class="container">
@@ -264,8 +281,16 @@ def join_group():
 
 @app.route('/g/<code>')
 def group_view(code):
-    db = get_db()
-    group = db['groups'].find_one({"code": code.upper()})
+    try:
+        db = get_db()
+        group = db['groups'].find_one({"code": code.upper()})
+    except Exception as e:
+        return render_template_string(BASE_TEMPLATE, title="Error", content=f'''
+        <div class="container">
+          <div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
+          <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div>
+        </div>'''), 500
+
     if not group:
         return redirect('/')
 
@@ -276,7 +301,6 @@ def group_view(code):
     for e in expenses:
         e.pop("_id", None)
 
-    # Calculate balances
     balances = {m: 0.0 for m in group["members"]}
     for exp in expenses:
         amount = exp["amount"]
@@ -397,8 +421,16 @@ def group_view(code):
 
 @app.route('/add/<code>', methods=['GET', 'POST'])
 def add_expense(code):
-    db = get_db()
-    group = db['groups'].find_one({"code": code.upper()})
+    try:
+        db = get_db()
+        group = db['groups'].find_one({"code": code.upper()})
+    except Exception as e:
+        return render_template_string(BASE_TEMPLATE, title="Error", content=f'''
+        <div class="container">
+          <div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
+          <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div>
+        </div>'''), 500
+
     if not group:
         return redirect('/')
 
@@ -477,23 +509,29 @@ def add_expense(code):
 
 @app.route('/delete/<code>/<exp_id>', methods=['POST'])
 def delete_expense(code, exp_id):
-    db = get_db()
-    group = db['groups'].find_one({"code": code.upper()})
-    if group:
-        db['expenses'].delete_one({"group_id": group["id"], "id": exp_id})
+    try:
+        db = get_db()
+        group = db['groups'].find_one({"code": code.upper()})
+        if group:
+            db['expenses'].delete_one({"group_id": group["id"], "id": exp_id})
+    except Exception as e:
+        pass
     return redirect(url_for('group_view', code=code))
 
 
 @app.route('/api/<code>')
 def api_group(code):
-    db = get_db()
-    group = db['groups'].find_one({"code": code.upper()})
+    try:
+        db = get_db()
+        group = db['groups'].find_one({"code": code.upper()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
     if not group:
         return jsonify({"error": "not found"}), 404
 
     group_id = group["id"]
     expenses = list(db['expenses'].find({"group_id": group_id}).sort("_id", 1))
-    # Remove MongoDB's _id field (not JSON serializable)
     for e in expenses:
         e.pop("_id", None)
     group_doc = {k: v for k, v in group.items() if k != "_id"}
