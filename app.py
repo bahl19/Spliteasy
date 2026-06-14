@@ -1,5 +1,6 @@
 import os
 import secrets
+import hmac
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for
 from markupsafe import escape
@@ -52,6 +53,27 @@ def simplify_debts(balances):
             j += 1
     return transactions
 
+def compute_balances(group, expenses):
+    """Compute balances using per-expense participants."""
+    members = group["members"]
+    balances = {m: 0.0 for m in members}
+    for exp in expenses:
+        amount = exp["amount"]
+        payer = exp["payer"]
+        participants = exp.get("participants", members)  # backfill: all members
+        if not participants:
+            participants = members
+        share = round(amount / len(participants), 2)
+        # Credit the payer for the full amount they paid
+        if payer in balances:
+            balances[payer] += amount
+        # Debit each participant their share
+        for p in participants:
+            if p in balances:
+                balances[p] -= share
+    balances = {k: round(v, 2) for k, v in balances.items()}
+    return balances
+
 BASE_TEMPLATE = '''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -99,17 +121,20 @@ BASE_TEMPLATE = '''<!DOCTYPE html>
   .settlement .arrow { color: var(--accent2); font-size: 18px; }
   .settlement .amount { font-weight: 700; color: var(--yellow); margin-left: auto; }
   .expense {
-    display: flex; align-items: center; gap: 14px;
-    padding: 16px; background: var(--card2); border-radius: 12px; margin-bottom: 8px;
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px; background: var(--card2); border-radius: 12px; margin-bottom: 8px;
   }
   .expense .icon {
-    width: 42px; height: 42px; border-radius: 12px;
-    display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0;
+    width: 38px; height: 38px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0;
   }
   .expense .details { flex: 1; min-width: 0; }
-  .expense .desc { font-weight: 600; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .expense .meta { font-size: 12px; color: var(--text2); margin-top: 2px; }
-  .expense .amount { font-weight: 700; font-size: 16px; color: var(--green); flex-shrink: 0; }
+  .expense .desc { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .expense .meta { font-size: 11px; color: var(--text2); margin-top: 2px; }
+  .expense .amount { font-weight: 700; font-size: 15px; color: var(--green); flex-shrink: 0; }
+  .expense-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .edit-btn, .delete-btn { background: none; border: none; font-size: 16px; cursor: pointer; padding: 4px 6px; opacity: 0.6; }
+  .edit-btn:hover, .delete-btn:hover { opacity: 1; }
   .form-group { margin-bottom: 16px; }
   .form-group label { display: block; font-size: 13px; color: var(--text2); margin-bottom: 6px; font-weight: 500; }
   input, select {
@@ -135,6 +160,7 @@ BASE_TEMPLATE = '''<!DOCTYPE html>
     cursor: pointer; transition: all 0.2s;
   }
   .chip.active { border-color: var(--accent); background: var(--accent); color: white; }
+  .chip.checkbox-chip { user-select: none; }
   .tabs { display: flex; background: var(--card); border-radius: 14px; padding: 4px; margin-bottom: 16px; border: 1px solid var(--border); }
   .tab { flex: 1; padding: 12px; text-align: center; border-radius: 11px; font-size: 13px; font-weight: 600; color: var(--text2); text-decoration: none; cursor: pointer; }
   .tab.active { background: var(--accent); color: white; }
@@ -148,8 +174,6 @@ BASE_TEMPLATE = '''<!DOCTYPE html>
   }
   .total-bar .label { font-size: 13px; opacity: 0.85; }
   .total-bar .value { font-size: 24px; font-weight: 800; }
-  .delete-btn { background: none; border: none; color: var(--red); font-size: 18px; cursor: pointer; padding: 4px 8px; opacity: 0.6; }
-  .delete-btn:hover { opacity: 1; }
   .cat-food { background: #2d1b1b; } .cat-travel { background: #1b2d2d; }
   .cat-shopping { background: #1b1b2d; } .cat-bill { background: #2d2d1b; }
   .cat-fun { background: #2d1b2d; } .cat-other { background: #1b1b1b; }
@@ -166,6 +190,12 @@ BASE_TEMPLATE = '''<!DOCTYPE html>
   }
   .share-box { background: var(--card2); border-radius: 12px; padding: 16px; margin-top: 12px; }
   .share-box input { background: var(--bg); font-size: 13px; padding: 10px 12px; }
+  .donut-container { text-align: center; margin-bottom: 16px; }
+  .donut-legend { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 8px; }
+  .legend-item { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text2); }
+  .legend-color { width: 12px; height: 12px; border-radius: 3px; }
+  .error-box { background: #2d1b1b; border: 1px solid var(--red); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .error-box p { color: var(--red); font-size: 14px; }
 </style>
 </head>
 <body>
@@ -231,23 +261,16 @@ def create_group():
     member_name = request.form['member_name'].strip()
     group_id = secrets.token_urlsafe(16)
     code = secrets.token_hex(3).upper()
-
     try:
         db = get_db()
         db['groups'].insert_one({
-            "code": code,
-            "id": group_id,
-            "name": group_name,
-            "members": [member_name],
-            "created": datetime.now().isoformat()
+            "code": code, "id": group_id, "name": group_name,
+            "members": [member_name], "created": datetime.now().isoformat()
         })
     except Exception as e:
         return render_template_string(BASE_TEMPLATE, title="Error", content=f'''
-        <div class="container">
-          <div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
-          <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div>
-        </div>'''), 500
-
+        <div class="container"><div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
+        <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div></div>'''), 500
     return redirect(url_for('group_view', code=code))
 
 
@@ -255,27 +278,19 @@ def create_group():
 def join_group():
     code = request.form['group_code'].strip().upper()
     member_name = request.form['member_name'].strip()
-
     try:
         db = get_db()
         group = db['groups'].find_one({"code": code})
     except Exception as e:
         return render_template_string(BASE_TEMPLATE, title="Error", content=f'''
-        <div class="container">
-          <div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
-          <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div>
-        </div>'''), 500
-
+        <div class="container"><div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
+        <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div></div>'''), 500
     if not group:
         return render_template_string(BASE_TEMPLATE, title="Error", content='''
-        <div class="container">
-          <div class="empty"><div class="emoji">😕</div><p>Group not found. Check the code!</p>
-          <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div>
-        </div>'''), 404
-
+        <div class="container"><div class="empty"><div class="emoji">😕</div><p>Group not found. Check the code!</p>
+        <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div></div>'''), 404
     if member_name not in group["members"]:
         db['groups'].update_one({"code": code}, {"$addToSet": {"members": member_name}})
-
     return redirect(url_for('group_view', code=code))
 
 
@@ -286,14 +301,10 @@ def group_view(code):
         group = db['groups'].find_one({"code": code.upper()})
     except Exception as e:
         return render_template_string(BASE_TEMPLATE, title="Error", content=f'''
-        <div class="container">
-          <div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
-          <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div>
-        </div>'''), 500
-
+        <div class="container"><div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
+        <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div></div>'''), 500
     if not group:
         return redirect('/')
-
     group_id = group["id"]
     expenses = list(db['expenses'].find({"group_id": group_id}).sort("_id", 1))
     total = sum(e["amount"] for e in expenses)
@@ -301,23 +312,40 @@ def group_view(code):
     for e in expenses:
         e.pop("_id", None)
 
-    balances = {m: 0.0 for m in group["members"]}
-    for exp in expenses:
-        amount = exp["amount"]
-        payer = exp["payer"]
-        share = round(amount / len(group["members"]), 2)
-        for m in group["members"]:
-            if m == payer:
-                balances[m] += amount - share
-            else:
-                balances[m] -= share
-    balances = {k: round(v, 2) for k, v in balances.items()}
+    balances = compute_balances(group, expenses)
     debts = simplify_debts(balances)
 
     cat_icons = {"🍽️ Food":"🍽️","✈️ Travel":"✈️","🛒 Shopping":"🛒","📱 Bills":"📱","🎉 Fun":"🎉","📦 Other":"📦"}
     cat_classes = {"🍽️ Food":"cat-food","✈️ Travel":"cat-travel","🛒 Shopping":"cat-shopping","📱 Bills":"cat-bill","🎉 Fun":"cat-fun","📦 Other":"cat-other"}
-
     share_url = request.url_root + 'g/' + code.upper()
+
+    # Category totals for donut chart
+    cat_totals = {}
+    for e in expenses:
+        cat = e.get('category', '📦 Other')
+        cat_totals[cat] = cat_totals.get(cat, 0) + e["amount"]
+    cat_colors = {"🍽️ Food":"#e17055","✈️ Travel":"#00b894","🛒 Shopping":"#6c5ce7","📱 Bills":"#fdcb6e","🎉 Fun":"#e84393","📦 Other":"#636e72"}
+
+    donut_html = ""
+    if cat_totals:
+        # Build SVG donut
+        radius = 70
+        circumference = 2 * 3.14159 * radius
+        offset = 0
+        slices = []
+        legend_items = []
+        for cat, amt in sorted(cat_totals.items(), key=lambda x: -x[1]):
+            pct = amt / total
+            dash = pct * circumference
+            gap = circumference - dash
+            color = cat_colors.get(cat, "#636e72")
+            slices.append(f'<circle cx="80" cy="80" r="{radius}" fill="none" stroke="{color}" stroke-width="20" stroke-dasharray="{dash:.1f} {gap:.1f}" stroke-dashoffset="{-offset:.1f}" transform="rotate(-90 80 80)"/>')
+            offset += dash
+            legend_items.append(f'<div class="legend-item"><div class="legend-color" style="background:{color}"></div>{escape(cat)} ₹{amt:,.0f}</div>')
+        donut_html = f'''<div class="donut-container">
+            <svg width="160" height="160" viewBox="0 0 160 160">{''.join(slices)}</svg>
+            <div class="donut-legend">{''.join(legend_items)}</div>
+        </div>'''
 
     settlement_html = ""
     for d in debts:
@@ -343,16 +371,21 @@ def group_view(code):
     expense_html = ""
     for e in reversed(expenses):
         cat = e.get('category', '📦 Other')
+        participants = e.get('participants', group["members"])
+        participant_str = ", ".join(escape(p) for p in participants)
         expense_html += f'''<div class="expense">
           <div class="icon {cat_classes.get(cat,'cat-other')}">{cat_icons.get(cat,'📦')}</div>
           <div class="details">
             <div class="desc">{escape(e['description'])}</div>
-            <div class="meta">Paid by {escape(e['payer'])} · {e.get('date','')}</div>
+            <div class="meta">Paid by {escape(e['payer'])} · {e.get('date','')} · Split: {participant_str}</div>
           </div>
           <div class="amount">₹{e['amount']:,.0f}</div>
-          <form action="/delete/{code}/{e.get('id','')}" method="POST" style="display:inline">
-            <button class="delete-btn" onclick="return confirm('Delete this expense?')">🗑️</button>
-          </form>
+          <div class="expense-actions">
+            <a href="/edit/{code}/{e.get('id','')}" class="edit-btn" title="Edit">✏️</a>
+            <form action="/delete/{code}/{e.get('id','')}" method="POST" style="display:inline">
+              <button class="delete-btn" onclick="return confirm('Delete this expense?')" title="Delete">🗑️</button>
+            </form>
+          </div>
         </div>'''
     if not expenses:
         expense_html = '<div class="empty"><div class="emoji">🧾</div><p>No expenses yet.<br>Add the first one!</p></div>'
@@ -370,12 +403,12 @@ def group_view(code):
         <div class="tab" onclick="showTab('expenses',this)">Expenses</div>
         <div class="tab" onclick="showTab('share',this)">Share</div>
       </div>
-
       <div id="tab-balances">
         <div class="total-bar">
           <div><div class="label">Total Spent</div><div class="value">₹{total:,.0f}</div></div>
           <div style="text-align:right"><div class="label">Per Person</div><div class="value" style="font-size:18px">₹{per_person:,.0f}</div></div>
         </div>
+        {donut_html}
         <div class="card">
           <div class="card-title">Who owes whom</div>
           {settlement_html}
@@ -385,9 +418,7 @@ def group_view(code):
           <div class="balance-grid">{balance_html}</div>
         </div>
       </div>
-
       <div id="tab-expenses" style="display:none">{expense_html}</div>
-
       <div id="tab-share" style="display:none">
         <div class="card">
           <div class="card-title">Invite Friends</div>
@@ -404,7 +435,6 @@ def group_view(code):
           <p style="text-align:center;color:var(--text2);font-size:13px;">Share this code for others to join</p>
         </div>
       </div>
-
       <a href="/add/{code}" class="add-btn" title="Add Expense">+</a>
     </div>
     <script>
@@ -415,7 +445,6 @@ def group_view(code):
       el.classList.add('active');
     }}
     </script>'''
-
     return render_template_string(BASE_TEMPLATE, title=group['name'], content=html)
 
 
@@ -426,40 +455,39 @@ def add_expense(code):
         group = db['groups'].find_one({"code": code.upper()})
     except Exception as e:
         return render_template_string(BASE_TEMPLATE, title="Error", content=f'''
-        <div class="container">
-          <div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
-          <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div>
-        </div>'''), 500
-
+        <div class="container"><div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
+        <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div></div>'''), 500
     if not group:
         return redirect('/')
-
     if request.method == 'POST':
         description = request.form['description'].strip()
         amount = float(request.form['amount'])
         payer = request.form['payer']
         category = request.form.get('category', '📦 Other')
-
+        participants = request.form.getlist('participants')
+        if not participants:
+            return render_template_string(BASE_TEMPLATE, title="Error", content=f'''
+            <div class="container"><div class="error-box"><p>At least one participant must be selected.</p>
+            <a href="/add/{code}" class="btn btn-outline" style="margin-top:12px;">Go Back</a></div></div>'''), 400
         db['expenses'].insert_one({
-            "id": secrets.token_hex(8),
-            "group_id": group["id"],
-            "description": description,
-            "amount": amount,
-            "payer": payer,
-            "category": category,
-            "date": datetime.now().strftime("%d %b"),
-            "created": datetime.now().isoformat()
+            "id": secrets.token_hex(8), "group_id": group["id"],
+            "description": description, "amount": amount, "payer": payer,
+            "category": category, "participants": participants,
+            "date": datetime.now().strftime("%d %b"), "created": datetime.now().isoformat()
         })
-
         return redirect(url_for('group_view', code=code))
 
     categories = ["🍽️ Food", "✈️ Travel", "🛒 Shopping", "📱 Bills", "🎉 Fun", "📦 Other"]
-    member_chips = ""
     payer_chips = ""
     for i, m in enumerate(group["members"]):
         payer_chips += f'<div class="chip {"active" if i==0 else ""}" onclick="selectPayer(this)">{escape(m)}</div>'
+    cat_chips = ""
     for i, c in enumerate(categories):
-        member_chips += f'<div class="chip {"active" if i==0 else ""}" onclick="selectChip(this)" data-value="{c}">{c}</div>'
+        cat_chips += f'<div class="chip {"active" if i==0 else ""}" onclick="selectChip(this)" data-value="{c}">{c}</div>'
+    # Participant checkboxes — all pre-selected
+    participant_chips = ""
+    for m in group["members"]:
+        participant_chips += f'<label class="chip checkbox-chip active" onclick="toggleChip(this)"><input type="checkbox" name="participants" value="{escape(m)}" checked style="display:none">{escape(m)}</label>'
 
     html = f'''<div class="container">
       <div class="header">
@@ -478,13 +506,17 @@ def add_expense(code):
           </div>
           <div class="form-group">
             <label>Category</label>
-            <div class="member-chips">{member_chips}</div>
+            <div class="member-chips">{cat_chips}</div>
             <input type="hidden" name="category" id="category" value="{categories[0]}">
           </div>
           <div class="form-group">
             <label>Who paid?</label>
             <div class="member-chips" id="payer-chips">{payer_chips}</div>
             <input type="hidden" name="payer" id="payer" value="{escape(group['members'][0])}">
+          </div>
+          <div class="form-group">
+            <label>Split among</label>
+            <div class="member-chips" id="participant-chips">{participant_chips}</div>
           </div>
         </div>
         <button type="submit" class="btn btn-primary" style="margin-top:8px">Add Expense ✓</button>
@@ -502,9 +534,117 @@ def add_expense(code):
       el.classList.add('active');
       document.getElementById('payer').value = el.textContent;
     }}
+    function toggleChip(el) {{
+      el.classList.toggle('active');
+      var cb = el.querySelector('input[type=checkbox]');
+      cb.checked = !cb.checked;
+    }}
     </script>'''
-
     return render_template_string(BASE_TEMPLATE, title="Add Expense", content=html)
+
+
+@app.route('/edit/<code>/<exp_id>', methods=['GET', 'POST'])
+def edit_expense(code, exp_id):
+    try:
+        db = get_db()
+        group = db['groups'].find_one({"code": code.upper()})
+    except Exception as e:
+        return render_template_string(BASE_TEMPLATE, title="Error", content=f'''
+        <div class="container"><div class="empty"><div class="emoji">⚠️</div><p>Database error: {escape(str(e))}</p>
+        <a href="/" class="btn btn-primary" style="margin-top:20px;">Go Back</a></div></div>'''), 500
+    if not group:
+        return redirect('/')
+    expense = db['expenses'].find_one({"id": exp_id, "group_id": group["id"]})
+    if not expense:
+        return redirect(url_for('group_view', code=code))
+
+    if request.method == 'POST':
+        description = request.form['description'].strip()
+        amount = float(request.form['amount'])
+        payer = request.form['payer']
+        category = request.form.get('category', '📦 Other')
+        participants = request.form.getlist('participants')
+        if not participants:
+            return render_template_string(BASE_TEMPLATE, title="Error", content=f'''
+            <div class="container"><div class="error-box"><p>At least one participant must be selected.</p>
+            <a href="/edit/{code}/{exp_id}" class="btn btn-outline" style="margin-top:12px;">Go Back</a></div></div>'''), 400
+        db['expenses'].update_one(
+            {"id": exp_id},
+            {"$set": {
+                "description": description, "amount": amount, "payer": payer,
+                "category": category, "participants": participants
+            }}
+        )
+        return redirect(url_for('group_view', code=code))
+
+    categories = ["🍽️ Food", "✈️ Travel", "🛒 Shopping", "📱 Bills", "🎉 Fun", "📦 Other"]
+    current_participants = expense.get('participants', group["members"])
+    payer_chips = ""
+    for m in group["members"]:
+        active = "active" if m == expense.get('payer', group["members"][0]) else ""
+        payer_chips += f'<div class="chip {active}" onclick="selectPayer(this)">{escape(m)}</div>'
+    cat_chips = ""
+    for c in categories:
+        active = "active" if c == expense.get('category', '📦 Other') else ""
+        cat_chips += f'<div class="chip {active}" onclick="selectChip(this)" data-value="{c}">{c}</div>'
+    participant_chips = ""
+    for m in group["members"]:
+        checked = "checked" if m in current_participants else ""
+        active = "active" if m in current_participants else ""
+        participant_chips += f'<label class="chip checkbox-chip {active}" onclick="toggleChip(this)"><input type="checkbox" name="participants" value="{escape(m)}" {checked} style="display:none">{escape(m)}</label>'
+
+    html = f'''<div class="container">
+      <div class="header">
+        <h1>✏️ Edit Expense</h1>
+        <div class="subtitle">{escape(group['name'])}</div>
+      </div>
+      <form method="POST">
+        <div class="card">
+          <div class="form-group">
+            <label>What was this for?</label>
+            <input type="text" name="description" value="{escape(expense.get('description',''))}" required autofocus>
+          </div>
+          <div class="form-group">
+            <label>Amount (₹)</label>
+            <input type="number" name="amount" value="{expense.get('amount',0)}" min="1" step="0.01" required inputmode="decimal">
+          </div>
+          <div class="form-group">
+            <label>Category</label>
+            <div class="member-chips">{cat_chips}</div>
+            <input type="hidden" name="category" id="category" value="{expense.get('category','📦 Other')}">
+          </div>
+          <div class="form-group">
+            <label>Who paid?</label>
+            <div class="member-chips" id="payer-chips">{payer_chips}</div>
+            <input type="hidden" name="payer" id="payer" value="{escape(expense.get('payer', group['members'][0]))}">
+          </div>
+          <div class="form-group">
+            <label>Split among</label>
+            <div class="member-chips" id="participant-chips">{participant_chips}</div>
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary" style="margin-top:8px">Save Changes ✓</button>
+        <a href="/g/{code}" class="btn btn-outline" style="margin-top:8px">Cancel</a>
+      </form>
+    </div>
+    <script>
+    function selectChip(el) {{
+      el.parentElement.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+      el.classList.add('active');
+      document.getElementById('category').value = el.dataset.value;
+    }}
+    function selectPayer(el) {{
+      document.querySelectorAll('#payer-chips .chip').forEach(c => c.classList.remove('active'));
+      el.classList.add('active');
+      document.getElementById('payer').value = el.textContent;
+    }}
+    function toggleChip(el) {{
+      el.classList.toggle('active');
+      var cb = el.querySelector('input[type=checkbox]');
+      cb.checked = !cb.checked;
+    }}
+    </script>'''
+    return render_template_string(BASE_TEMPLATE, title="Edit Expense", content=html)
 
 
 @app.route('/delete/<code>/<exp_id>', methods=['POST'])
@@ -514,7 +654,7 @@ def delete_expense(code, exp_id):
         group = db['groups'].find_one({"code": code.upper()})
         if group:
             db['expenses'].delete_one({"group_id": group["id"], "id": exp_id})
-    except Exception as e:
+    except Exception:
         pass
     return redirect(url_for('group_view', code=code))
 
@@ -526,35 +666,77 @@ def api_group(code):
         group = db['groups'].find_one({"code": code.upper()})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
     if not group:
         return jsonify({"error": "not found"}), 404
-
     group_id = group["id"]
     expenses = list(db['expenses'].find({"group_id": group_id}).sort("_id", 1))
     for e in expenses:
         e.pop("_id", None)
     group_doc = {k: v for k, v in group.items() if k != "_id"}
-
-    balances = {m: 0.0 for m in group_doc["members"]}
-    for exp in expenses:
-        amount = exp["amount"]
-        payer = exp["payer"]
-        share = round(amount / len(group_doc["members"]), 2)
-        for m in group_doc["members"]:
-            if m == payer:
-                balances[m] += amount - share
-            else:
-                balances[m] -= share
-
+    balances = compute_balances(group_doc, expenses)
     return jsonify({
         "group": group_doc["name"],
         "members": group_doc["members"],
         "total": sum(e["amount"] for e in expenses),
-        "balances": {k: round(v, 2) for k, v in balances.items()},
+        "balances": balances,
         "settlements": simplify_debts(balances),
         "expenses": expenses
     })
+
+
+@app.route('/admin', methods=['GET', 'POST'])
+def admin():
+    # Get token from header or form field — NEVER from query string
+    token = request.headers.get('X-Admin-Token') or (request.form.get('token') if request.method == 'POST' else None)
+    expected = os.environ.get('ADMIN_TOKEN', '')
+    if not expected or not token or not hmac.compare_digest(token, expected):
+        return render_template_string(BASE_TEMPLATE, title="Forbidden", content='''
+        <div class="container"><div class="empty"><div class="emoji">🔒</div><p>Access denied.</p></div></div>'''), 403
+
+    try:
+        db = get_db()
+        total_groups = db['groups'].count_documents({})
+        total_expenses = db['expenses'].count_documents({})
+        pipeline = [{"$group": {"_id": None, "total_volume": {"$sum": "$amount"}}}]
+        volume_result = list(db['expenses'].aggregate(pipeline))
+        total_volume = volume_result[0]["total_volume"] if volume_result else 0
+        avg_expenses = round(total_expenses / total_groups, 1) if total_groups else 0
+
+        groups = list(db['groups'].find())
+        group_rows = ""
+        for g in groups:
+            g_name = escape(g.get('name', 'Unnamed'))
+            g_members = len(g.get('members', []))
+            g_exp_count = db['expenses'].count_documents({"group_id": g["id"]})
+            g_pipeline = [{"$match": {"group_id": g["id"]}}, {"$group": {"_id": None, "total": {"$sum": "$amount"}}}]
+            g_vol = list(db['expenses'].aggregate(g_pipeline))
+            g_total = g_vol[0]["total"] if g_vol else 0
+            group_rows += f'<tr><td>{g_name}</td><td>{g_members}</td><td>{g_exp_count}</td><td>₹{g_total:,.0f}</td></tr>'
+
+        html = f'''<div class="container">
+          <div class="header"><h1>📊 Admin Analytics</h1></div>
+          <div class="card">
+            <div class="card-title">Overview</div>
+            <div class="balance-grid">
+              <div class="balance-row"><span class="name">Total Groups</span><span class="amount zero">{total_groups}</span></div>
+              <div class="balance-row"><span class="name">Total Expenses</span><span class="amount zero">{total_expenses}</span></div>
+              <div class="balance-row"><span class="name">Total Volume</span><span class="amount positive">₹{total_volume:,.0f}</span></div>
+              <div class="balance-row"><span class="name">Avg Expenses/Group</span><span class="amount zero">{avg_expenses}</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-title">Groups</div>
+            <table style="width:100%;font-size:14px;border-collapse:collapse;">
+              <tr style="color:var(--text2);text-align:left;border-bottom:1px solid var(--border);">
+                <th style="padding:8px 4px;">Name</th><th style="padding:8px 4px;">Members</th><th style="padding:8px 4px;">Expenses</th><th style="padding:8px 4px;">Total</th>
+              </tr>
+              {group_rows}
+            </table>
+          </div>
+        </div>'''
+        return render_template_string(BASE_TEMPLATE, title="Admin", content=html)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == '__main__':
