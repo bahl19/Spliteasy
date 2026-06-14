@@ -1,0 +1,8 @@
+{
+  "name": "split-easy",
+  "description": "Simple expense splitting for friend groups",
+  "repository": "https://github.com/spliteasy/spliteasy",
+  "env": {
+    "PYTHON_VERSION": "3.11.0"
+  }
+}
